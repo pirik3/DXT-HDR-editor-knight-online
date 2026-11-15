@@ -16,13 +16,17 @@ You can also drag a .dxt or .png onto this script in Explorer.
  
 The PNG -> DXT step needs the ORIGINAL .dxt as a template. It copies the
 header (name, flags, size, format, mipmap) from it, so the new file matches
-what the game expects. For encrypted files it also takes the XOR key from it.
+what the game expects.
  
-Encryption (flag bit 0x04): every row of every mip level is XOR'd with the
-first <row length> bytes of one key. The key is recovered from a fully
-transparent row of the original texture, so the original must have at least
-two transparent rows. Verified for raw formats (A4R4G4B4 etc.); encrypted
-DXT1/3/5 files are refused with an error.
+Encryption (NTF version 7): RC4 with the N3Base CWinCrypt key (built in).
+The engine restarts the keystream for every read: once per row for
+uncompressed images, once per mip level for DXT data. Encrypted files are
+decrypted on export and re-encrypted on import, so the result stays v7.
+ 
+DXT1/3/5 files also carry a half-size uncompressed copy; it is rebuilt
+from your PNG too.
+ 
+--plain   write an UNENCRYPTED file instead (version byte 7 -> 3)
  
 Needs: pip install pillow numpy
 """
@@ -35,6 +39,7 @@ from PIL import Image
  
 RAW_BPP = {20: 3, 21: 4, 22: 4, 23: 2, 24: 2, 25: 2, 26: 2}
 DXT = (b'DXT1', b'DXT3', b'DXT5')
+COMPANION = {b'DXT1': 25, b'DXT3': 26, b'DXT5': 26}
  
  
 # ---------------------------------------------------------------- header
@@ -48,8 +53,9 @@ def read_dxt(path):
     flags = data[off + 3]
     w, h = struct.unpack_from('<ii', data, off + 4)
     fourcc = data[off + 12:off + 16]
+    mip = struct.unpack_from('<i', data, off + 16)[0]
     hdr_end = off + 20
-    return {'header': data[:hdr_end], 'flags': flags, 'w': w, 'h': h,
+    return {'header': data[:hdr_end], 'flags': flags, 'w': w, 'h': h, 'mip': mip,
             'fourcc': fourcc, 'payload': data[hdr_end:]}
  
  
@@ -71,46 +77,102 @@ def row_layout(w, h, fourcc):
     return w * RAW_BPP[fmt_code(fourcc)], h
  
  
-def mip_levels(w, h, fourcc, payload_len):
-    """List of (w, h) levels that exactly fill the payload."""
-    levels, used = [], 0
-    while True:
-        rl, rows = row_layout(w, h, fourcc)
-        if used + rl * rows > payload_len:
-            break
+def chain(w, h, has_mips):
+    """Mip levels the game stores: halve until a side would drop below 4."""
+    levels = [(w, h)]
+    while has_mips and min(w, h) // 2 >= 4:
+        w, h = w // 2, h // 2
         levels.append((w, h))
-        used += rl * rows
-        if w == 1 and h == 1:
-            break
-        w, h = max(1, w // 2), max(1, h // 2)
-    if not levels:
-        raise ValueError("Payload is smaller than the first mip level")
     return levels
  
  
+def chain_size(levels, fourcc):
+    return sum(row_layout(w, h, fourcc)[0] * row_layout(w, h, fourcc)[1] for w, h in levels)
+ 
+ 
+def layout(info):
+    """Segments [(fourcc, levels)] that make up the payload.
+    DXT textures carry a second, uncompressed half-size copy after the DXT
+    mip chain (A1R5G5B5 for DXT1, A4R4G4B4 for DXT3/5)."""
+    fc, w, h, n = info['fourcc'], info['w'], info['h'], len(info['payload'])
+    main = chain(w, h, info['mip'])
+    segs, size = [(fc, main)], chain_size(main, fc)
+    if fc in DXT and n > size:
+        cfc = struct.pack('<i', COMPANION[fc])
+        comp = chain(max(1, w // 2), max(1, h // 2), info['mip'])
+        segs.append((cfc, comp))
+        size += chain_size(comp, cfc)
+    if size != n:
+        raise ValueError(f"Unexpected data layout: payload is {n} bytes, expected {size}")
+    return segs
+ 
+ 
 # ---------------------------------------------------------------- encryption
+# One global key, the same in every file seen so far. Each row of each mip
+# level of an uncompressed image is XOR'd with key[:row length].
+# The key for the DXT-compressed part is NOT known yet.
  
-def recover_key(info):
-    if info['fourcc'] in DXT:
-        # A transparent DXT block is not all zero bytes, and the exact bytes the
-        # game's tool wrote are unknown, so the key cannot be recovered safely.
-        raise ValueError("Encrypted DXT1/3/5 textures are not supported yet "
-                         "(only encrypted raw formats like A4R4G4B4 were verified)")
-    rl, rows = row_layout(info['w'], info['h'], info['fourcc'])
-    lvl = np.frombuffer(info['payload'][:rl * rows], np.uint8).reshape(rows, rl)
-    _, idx, counts = np.unique(lvl, axis=0, return_index=True, return_counts=True)
-    if counts.max() < 2:
-        raise ValueError("Encrypted texture has no fully transparent row; cannot recover the key")
-    return lvl[idx[counts.argmax()]].copy()
+GLOBAL_KEY = np.frombuffer(bytes.fromhex(
+    "904d4f1f13a9e5f3f8de11d1f2981a33cade2324524f0325d68c25b3719f0a2c6be8d3af79a4ae564dce47893b9f7cc6d09ab82093c894f7d2cf192378316304280286e2b6256bd5307713e9f37d3436efb5d7f782daec0959b82ad57fe32e789ba88a9e79421a3fc67c4bb615626a31e3fcff12ef49f9ddf6912149d86d868d295abdef84f9fe07d5cc4a0e3d89d44bd5d3133806f62e3e46854110ef66e29379fd4dd89a348c0f11cf5f3b23586b3c51162a33b95842b9146c4944175d31a51da200c386352713f52a4cf864b9612e377165935e85e55ca191ae77f718be235b0b7149d1dfb76d9a294d80200fb3274f523695c419a285bbc085b93d0c8633"), np.uint8)
  
  
-def xor_levels(payload, levels, fourcc, key):
-    out, off = bytearray(payload), 0
+# RC4 key: SHA-1 of the N3Base CWinCrypt password, first 16 bytes
+# (CryptoAPI MS_ENHANCED_PROV, CryptDeriveKey CALG_RC4 128-bit).
+# Verified: its keystream matches the 256 bytes recovered from secret_box.dxt.
+_CIPHER = b"owsd9012%$1as!wpow1033b%!@%12"
+_KEYSTREAM = np.zeros(0, np.uint8)
+ 
+ 
+def keystream(length):
+    """First `length` bytes of the RC4 keystream (cached, grows on demand)."""
+    global _KEYSTREAM
+    if len(_KEYSTREAM) >= length:
+        return _KEYSTREAM
+    import hashlib
+    key = hashlib.sha1(_CIPHER).digest()[:16]
+    S = list(range(256))
+    j = 0
+    for i in range(256):
+        j = (j + S[i] + key[i % 16]) & 255
+        S[i], S[j] = S[j], S[i]
+    n = max(length, 65536)
+    out = bytearray(n)
+    i = j = 0
+    for k in range(n):
+        i = (i + 1) & 255
+        j = (j + S[i]) & 255
+        S[i], S[j] = S[j], S[i]
+        out[k] = S[(S[i] + S[j]) & 255]
+    _KEYSTREAM = np.frombuffer(bytes(out), np.uint8)
+    return _KEYSTREAM
+ 
+ 
+def key_for(length, info=None):
+    """Keystream bytes for one decrypt region of `length` bytes."""
+    return keystream(length)
+ 
+ 
+def has_key(length):
+    return True
+ 
+ 
+def region_sizes(levels, fourcc):
+    """Sizes of the regions the engine decrypts separately: one region per
+    DXT mip level, one region per row for uncompressed formats."""
+    out = []
     for w, h in levels:
         rl, rows = row_layout(w, h, fourcc)
-        blk = np.frombuffer(payload, np.uint8, rl * rows, off).reshape(rows, rl)
-        out[off:off + rl * rows] = (blk ^ key[:rl]).tobytes()
-        off += rl * rows
+        out += [rl * rows] if fourcc in DXT else [rl] * rows
+    return out
+ 
+ 
+def xor_segment(payload, off, levels, fourcc, info=None):
+    out = bytearray(payload)
+    for n in region_sizes(levels, fourcc):
+        key = key_for(n, info)
+        blk = np.frombuffer(payload, np.uint8, n, off)
+        out[off:off + n] = (blk ^ key[:n]).tobytes()
+        off += n
     return bytes(out)
  
  
@@ -276,49 +338,90 @@ def decode_dxt(pix, w, h, fourcc):
  
 # ---------------------------------------------------------------- top level
  
+def decode_any(pix, w, h, fourcc):
+    if fourcc in DXT:
+        return decode_dxt(pix, w, h, fourcc)
+    return decode_raw(pix, w, h, fmt_code(fourcc))
+ 
+ 
+def encode_any(arr, fourcc):
+    return encode_dxt(arr, fourcc) if fourcc in DXT else encode_raw(arr, fmt_code(fourcc))
+ 
+ 
 def dxt_to_png(dxt_path, png_path):
     info = read_dxt(dxt_path)
     check_format(info['fourcc'])
-    levels = mip_levels(info['w'], info['h'], info['fourcc'], len(info['payload']))
+    segs = layout(info)
+    enc = info['flags'] & 0x04
+    note = ''
+    fc, levels = segs[0]
+    off = 0
+    if enc and fc in DXT and not has_key(max(region_sizes(levels[:1], fc))):
+        if len(segs) < 2:
+            raise ValueError("Encrypted DXT texture could not be decrypted")
+        off = chain_size(segs[0][1], fc)
+        fc, levels = segs[1]
+        note = (f"exported the built-in {levels[0][0]}x{levels[0][1]} uncompressed copy "
+                "(full-size DXT could not be decrypted)")
     payload = info['payload']
-    if info['flags'] & 0x04:
-        payload = xor_levels(payload, levels, info['fourcc'], recover_key(info))
-    w, h = info['w'], info['h']
-    if info['fourcc'] in DXT:
-        arr = decode_dxt(payload, w, h, info['fourcc'])
-    else:
-        arr = decode_raw(payload, w, h, fmt_code(info['fourcc']))
+    if enc:
+        payload = xor_segment(payload, off, levels[:1], fc, info)
+    w, h = levels[0]
+    rl, rows = row_layout(w, h, fc)
+    arr = decode_any(payload[off:off + rl * rows], w, h, fc)
     Image.fromarray(arr, 'RGBA').save(png_path)
-    return info, levels
+    return info, segs, note
+ 
+ 
+PLAIN = False  # set by --plain: write encrypted templates as unencrypted files
  
  
 def png_to_dxt(png_path, template_path, out_path):
     info = read_dxt(template_path)
     check_format(info['fourcc'])
-    fourcc = info['fourcc']
-    levels = mip_levels(info['w'], info['h'], fourcc, len(info['payload']))
+    segs = layout(info)
+    enc = info['flags'] & 0x04
+    header = info['header']
+    plain_note = ''
+    if enc:
+        need = max(max(region_sizes(lv, fc)) for fc, lv in segs)
+        if PLAIN:
+            # Clear the encryption bit in the NTF version byte (7 -> 3).
+            pos = len(header) - 17
+            header = header[:pos] + bytes([header[pos] & ~0x04 & 0xFF]) + header[pos + 1:]
+            enc = 0
+            info = dict(info, flags=info['flags'] & ~0x04)
+            plain_note = "written UNENCRYPTED (--plain)"
     im = Image.open(png_path).convert('RGBA')
+    note = ''
     if im.size != (info['w'], info['h']):
-        print(f"  note: PNG is {im.size[0]}x{im.size[1]}, resized to {info['w']}x{info['h']} to match the template")
+        note = f"PNG was {im.size[0]}x{im.size[1]}, resized to {info['w']}x{info['h']}"
         im = im.resize((info['w'], info['h']), Image.LANCZOS)
-    payload = bytearray()
-    for w, h in levels:
-        arr = np.array(im if (w, h) == im.size else im.resize((w, h), Image.BOX))
-        payload += encode_dxt(arr, fourcc) if fourcc in DXT else encode_raw(arr, fmt_code(fourcc))
+    payload, offsets = bytearray(), []
+    for fc, levels in segs:
+        offsets.append(len(payload))
+        for w, h in levels:
+            arr = np.array(im if (w, h) == im.size else im.resize((w, h), Image.BOX))
+            payload += encode_any(arr, fc)
     payload = bytes(payload)
-    if info['flags'] & 0x04:
-        payload = xor_levels(payload, levels, fourcc, recover_key(info))
+    if enc:
+        for (fc, levels), off in zip(segs, offsets):
+            payload = xor_segment(payload, off, levels, fc, info)
     if len(payload) != len(info['payload']):
         raise RuntimeError(f"Size mismatch: {len(payload)} vs template {len(info['payload'])}")
     with open(out_path, 'wb') as f:
-        f.write(info['header'] + payload)
-    return info, levels
+        f.write(header + payload)
+    note = '; '.join(x for x in (note, plain_note) if x)
+    return info, segs, note
  
  
-def _describe(info, levels):
-    fmt = info['fourcc'].decode() if info['fourcc'] in DXT else f"raw code {fmt_code(info['fourcc'])}"
+def _describe(info, segs, note=''):
+    name = lambda fc: fc.decode() if fc in DXT else {20: 'R8G8B8', 21: 'A8R8G8B8', 22: 'X8R8G8B8',
+        23: 'R5G6B5', 24: 'X1R5G5B5', 25: 'A1R5G5B5', 26: 'A4R4G4B4'}.get(fmt_code(fc), fmt_code(fc))
+    parts = [f"{name(fc)} x{len(lv)} mips" for fc, lv in segs]
     enc = 'encrypted' if info['flags'] & 0x04 else 'not encrypted'
-    return f"{info['w']}x{info['h']}, {fmt}, {len(levels)} mip level(s), {enc}"
+    s = f"{info['w']}x{info['h']}, {' + '.join(parts)}, {enc}"
+    return s + (f"\n       note: {note}" if note else '')
  
  
 def _find_template(png_path):
@@ -351,15 +454,15 @@ def _batch(files):
         try:
             if src.lower().endswith('.dxt'):
                 out = os.path.splitext(src)[0] + '.png'
-                info, levels = dxt_to_png(src, out)
-                print(f"OK   {os.path.basename(src)} -> {os.path.basename(out)}  ({_describe(info, levels)})")
+                info, levels, note = dxt_to_png(src, out)
+                print(f"OK   {os.path.basename(src)} -> {os.path.basename(out)}  ({_describe(info, levels, note)})")
             else:
                 tpl = _find_template(src)
                 if not tpl:
                     raise ValueError("no .dxt with the same name next to it")
                 out = os.path.splitext(tpl)[0] + '_new.dxt'
-                info, levels = png_to_dxt(src, tpl, out)
-                print(f"OK   {os.path.basename(src)} -> {os.path.basename(out)}  ({_describe(info, levels)})")
+                info, levels, note = png_to_dxt(src, tpl, out)
+                print(f"OK   {os.path.basename(src)} -> {os.path.basename(out)}  ({_describe(info, levels, note)})")
             ok += 1
         except Exception as e:
             print(f"FAIL {os.path.basename(src)}: {e}")
@@ -368,6 +471,13 @@ def _batch(files):
  
  
 def main(argv):
+    global PLAIN
+    if '--plain' in argv:
+        PLAIN = True
+        argv = [a for a in argv if a != '--plain']
+    if not argv:
+        print(__doc__)
+        return
     argv = _expand(argv)
     if not argv:
         print("No matching files found.")
@@ -384,8 +494,8 @@ def main(argv):
         out = argv[2] if len(argv) > 2 else os.path.splitext(tpl)[0] + '_new.dxt'
         if os.path.abspath(out) == os.path.abspath(tpl):
             raise SystemExit("Refusing to overwrite the template; give a different output name.")
-        info, levels = png_to_dxt(src, tpl, out)
-        print(f"PNG -> DXT: {out}  (template: {tpl})\n  {_describe(info, levels)}")
+        info, levels, note = png_to_dxt(src, tpl, out)
+        print(f"PNG -> DXT: {out}  (template: {tpl})\n  {_describe(info, levels, note)}")
     else:
         print(__doc__)
  
@@ -395,6 +505,9 @@ if __name__ == '__main__':
         main(sys.argv[1:])
     except Exception as e:
         print(f"ERROR: {e}")
-    if len(sys.argv) == 2:  # drag-and-drop: keep the window open
-        input("\nPress Enter to close...")
+    if len(sys.argv) == 2 and sys.stdin.isatty():  # drag-and-drop: keep the window open
+        try:
+            input("\nPress Enter to close...")
+        except EOFError:
+            pass
  
